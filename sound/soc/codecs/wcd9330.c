@@ -51,7 +51,8 @@ enum {
 	ADC4_TXFE,
 	ADC5_TXFE,
 	ADC6_TXFE,
-	HPH_DELAY,
+	HPH_DELAY_L,
+	HPH_DELAY_R,
 };
 
 #define TOMTOM_MAD_SLIMBUS_TX_PORT 12
@@ -4419,21 +4420,42 @@ static int tomtom_hph_pa_event(struct snd_soc_dapm_widget *w,
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:
-		set_bit(HPH_DELAY, &tomtom->status_mask);
+		if (w->shift == 5)
+			set_bit(HPH_DELAY_L, &tomtom->status_mask);
+		else if (w->shift == 4)
+			set_bit(HPH_DELAY_R, &tomtom->status_mask);
+		else {
+			pr_err("%s: Invalid w->shift %d\n", __func__,
+				w->shift);
+			return -EINVAL;
+		}
 		/* Let MBHC module know PA is turning on */
 		wcd9xxx_resmgr_notifier_call(&tomtom->resmgr, e_pre_on);
 		break;
 
 	case SND_SOC_DAPM_POST_PMU:
-		if (test_bit(HPH_DELAY, &tomtom->status_mask)) {
+		if (test_bit(HPH_DELAY_L, &tomtom->status_mask)) {
 			/*
-			 * Make sure to wait 10ms after enabling HPHR_HPHL
+			 * Make sure to wait 10ms after enabling HPHL
 			 * in register 0x1AB
 			*/
 			usleep_range(pa_settle_time, pa_settle_time + 1000);
-			clear_bit(HPH_DELAY, &tomtom->status_mask);
+			clear_bit(HPH_DELAY_L, &tomtom->status_mask);
 			pr_debug("%s: sleep %d us after %s PA enable\n",
 				__func__, pa_settle_time, w->name);
+		} else if (test_bit(HPH_DELAY_R, &tomtom->status_mask)) {
+			/*
+			 * Make sure to wait 10ms after enabling HPHR
+			 * in register 0x1AB
+			*/
+			usleep_range(pa_settle_time, pa_settle_time + 1000);
+			clear_bit(HPH_DELAY_R, &tomtom->status_mask);
+			pr_debug("%s: sleep %d us after %s PA enable\n",
+				__func__, pa_settle_time, w->name);
+		} else {
+			pr_err("%s: Invalid w->shift %d\n", __func__,
+				w->shift);
+			return -EINVAL;
 		}
 		if (!high_perf_mode && !tomtom->uhqa_mode) {
 			wcd9xxx_clsh_fsm(codec, &tomtom->clsh_d,
@@ -4444,21 +4466,42 @@ static int tomtom_hph_pa_event(struct snd_soc_dapm_widget *w,
 		break;
 
 	case SND_SOC_DAPM_PRE_PMD:
-		set_bit(HPH_DELAY, &tomtom->status_mask);
+		if (w->shift == 5)
+			set_bit(HPH_DELAY_L, &tomtom->status_mask);
+		else if (w->shift == 4)
+			set_bit(HPH_DELAY_R, &tomtom->status_mask);
+		else {
+			pr_err("%s: Invalid w->shift %d\n", __func__,
+				 w->shift);
+			return -EINVAL;
+		}
 		break;
 
 	case SND_SOC_DAPM_POST_PMD:
 		/* Let MBHC module know PA turned off */
 		wcd9xxx_resmgr_notifier_call(&tomtom->resmgr, e_post_off);
-		if (test_bit(HPH_DELAY, &tomtom->status_mask)) {
+		if (test_bit(HPH_DELAY_L, &tomtom->status_mask)) {
 			/*
-			 * Make sure to wait 10ms after disabling HPHR_HPHL
+			 * Make sure to wait 10ms after disabling HPHL
 			 * in register 0x1AB
 			*/
 			usleep_range(pa_settle_time, pa_settle_time + 1000);
-			clear_bit(HPH_DELAY, &tomtom->status_mask);
+			clear_bit(HPH_DELAY_L, &tomtom->status_mask);
 			pr_debug("%s: sleep %d us after %s PA disable\n",
 				__func__, pa_settle_time, w->name);
+		} else if (test_bit(HPH_DELAY_R, &tomtom->status_mask)) {
+			/*
+			 * Make sure to wait 10ms after disabling HPHR
+			 * in register 0x1AB
+			*/
+			usleep_range(pa_settle_time, pa_settle_time + 1000);
+			clear_bit(HPH_DELAY_R, &tomtom->status_mask);
+			pr_debug("%s: sleep %d us after %s PA disable\n",
+				__func__, pa_settle_time, w->name);
+		} else {
+			pr_err("%s: Invalid w->shift %d\n", __func__,
+				 w->shift);
+			return -EINVAL;
 		}
 
 		break;
@@ -7502,16 +7545,28 @@ static int tomtom_handle_pdata(struct tomtom_priv *tomtom)
 		}
 	}
 
-	/* Set micbias capless mode with tail current */
-	value = (pdata->micbias.bias1_cap_mode == MICBIAS_EXT_BYP_CAP ?
-		 0x00 : 0x16);
+	//weihung[NBQM-2214]:It is obvious that this mic data wave has a toothed border ,and fixed it
+    pdata->micbias.bias1_cap_mode = MICBIAS_EXT_BYP_CAP;
+    pdata->micbias.bias3_cap_mode = MICBIAS_EXT_BYP_CAP;
+     value = (pdata->micbias.bias1_cap_mode == MICBIAS_EXT_BYP_CAP ?
+		 0x06 : 0x16);
 	snd_soc_update_bits(codec, TOMTOM_A_MICB_1_CTL, 0x1E, value);
-	value = (pdata->micbias.bias2_cap_mode == MICBIAS_EXT_BYP_CAP ?
-		 0x00 : 0x16);
-	snd_soc_update_bits(codec, TOMTOM_A_MICB_2_CTL, 0x1E, value);
 	value = (pdata->micbias.bias3_cap_mode == MICBIAS_EXT_BYP_CAP ?
-		 0x00 : 0x16);
+		 0x06 : 0x16);
 	snd_soc_update_bits(codec, TOMTOM_A_MICB_3_CTL, 0x1E, value);
+    //weihung [NBQM-2214]:It is obvious that this mic data wave has a toothed border ,and fixed it
+
+
+	/* Set micbias capless mode with tail current */
+	// value = (pdata->micbias.bias1_cap_mode == MICBIAS_EXT_BYP_CAP ?
+		 // 0x00 : 0x16);
+	// snd_soc_update_bits(codec, TOMTOM_A_MICB_1_CTL, 0x1E, value);
+	value = (pdata->micbias.bias2_cap_mode == MICBIAS_EXT_BYP_CAP ?
+		 0x06 : 0x16);
+	snd_soc_update_bits(codec, TOMTOM_A_MICB_2_CTL, 0x1E, value);
+	// value = (pdata->micbias.bias3_cap_mode == MICBIAS_EXT_BYP_CAP ?
+		 // 0x00 : 0x16);
+	// snd_soc_update_bits(codec, TOMTOM_A_MICB_3_CTL, 0x1E, value);
 	value = (pdata->micbias.bias4_cap_mode == MICBIAS_EXT_BYP_CAP ?
 		 0x00 : 0x16);
 	snd_soc_update_bits(codec, TOMTOM_A_MICB_4_CTL, 0x1E, value);
