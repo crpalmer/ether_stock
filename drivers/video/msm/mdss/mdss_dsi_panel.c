@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -36,6 +36,10 @@
 #define DT_CMD_HDR 6
 #define MIN_REFRESH_RATE 30
 #define DEFAULT_MDP_TRANSFER_TIME 14000
+
+#define LCM_PANEL_DEFAULT_FPS_VAL 60
+#define LCM_PANEL_MID_FPS_VAL     45
+#define LCM_PANEL_LOW_FPS_VAL     30
 
 DEFINE_LED_TRIGGER(bl_led_trigger);
 
@@ -807,7 +811,7 @@ static int mdss_dsi_panel_on(struct mdss_panel_data *pdata)
 	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
 
-	pr_debug("%s: ctrl=%p ndx=%d\n", __func__, ctrl, ctrl->ndx);
+	pr_debug("%s: ctrl=%pK ndx=%d\n", __func__, ctrl, ctrl->ndx);
 
 	if (pinfo->dcs_cmd_by_left) {
 		if (ctrl->ndx != DSI_CTRL_LEFT)
@@ -825,13 +829,25 @@ static int mdss_dsi_panel_on(struct mdss_panel_data *pdata)
 		mdss_dsi_panel_bl_ctrl(pdata, 0); //JY added to fix NBQM-435 20151123
 		mdss_dsi_panel_cmds_send(ctrl, on_cmds, CMD_REQ_COMMIT);
 	}
+
+	if (pinfo->dfps_update == DFPS_IMMEDIATE_LCM_CLK_UPDATE_MODE) {
+		/* Restore the dynamic frame rate */
+		int dynamic_rate = pinfo->mipi.refresh_rate;
+		pinfo->mipi.refresh_rate = DEFAULT_FRAME_RATE;
+
+		if ((pinfo->dynamic_fps == true) &&
+		    (dynamic_rate != DEFAULT_FRAME_RATE)) {
+			mdss_dsi_panel_update_fps(ctrl, dynamic_rate);
+		}
+	}
+
 	//Buda added for BBS log
 	if (1) panel_print_status(ctrl);
 	//Buda added for recovery backlight
 	if(strstr(saved_command_line, "androidboot.mode=1")!=NULL)
 	{
 		mdss_dsi_panel_bl_ctrl(pdata, 102);
-	}	
+	}
 end:
 	pinfo->blank_state = MDSS_PANEL_BLANK_UNBLANK;
 	pr_debug("%s:-\n", __func__);
@@ -852,7 +868,7 @@ static int mdss_dsi_panel_off(struct mdss_panel_data *pdata)
 	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
 
-	pr_debug("%s: ctrl=%p ndx=%d\n", __func__, ctrl, ctrl->ndx);
+	pr_debug("%s: ctrl=%pK ndx=%d\n", __func__, ctrl, ctrl->ndx);
 
 	if (pinfo->dcs_cmd_by_left) {
 		if (ctrl->ndx != DSI_CTRL_LEFT)
@@ -883,7 +899,7 @@ static int mdss_dsi_panel_low_power_config(struct mdss_panel_data *pdata,
 	ctrl = container_of(pdata, struct mdss_dsi_ctrl_pdata,
 				panel_data);
 
-	pr_debug("%s: ctrl=%p ndx=%d enable=%d\n", __func__, ctrl, ctrl->ndx,
+	pr_debug("%s: ctrl=%pK ndx=%d enable=%d\n", __func__, ctrl, ctrl->ndx,
 		enable);
 
 	/* Any panel specific low power commands/config */
@@ -1644,6 +1660,12 @@ static void mdss_dsi_parse_dfps_config(struct device_node *pan_node,
 			pinfo->dfps_update =
 				DFPS_IMMEDIATE_PORCH_UPDATE_MODE_VFP;
 			pr_debug("dfps mode: Immediate porch VFP\n");
+		} else if (!strcmp(data,
+				   "dfps_immediate_lcm_clk_update_mode")) {
+			pinfo->dfps_update =
+				DFPS_IMMEDIATE_LCM_CLK_UPDATE_MODE;
+			pinfo->mipi.refresh_rate = DEFAULT_FRAME_RATE;
+			pr_debug("dfps mode: Immediate LCM clk update mode\n");
 		} else {
 			pinfo->dfps_update = DFPS_SUSPEND_RESUME_MODE;
 			pr_debug("default dfps mode: suspend/resume\n");
@@ -1764,7 +1786,7 @@ static int mdss_dsi_panel_timing_from_dt(struct device_node *np,
 
 	if (np->name) {
 		pt->timing.name = kstrdup(np->name, GFP_KERNEL);
-		pr_info("%s: found new timing \"%s\" (%p)\n", __func__,
+		pr_info("%s: found new timing \"%s\" (%pK)\n", __func__,
 				np->name, &pt->timing);
 	}
 
@@ -2154,6 +2176,16 @@ static int mdss_panel_parse_dt(struct device_node *np,
 		"qcom,mdss-dsi-ce-off-command", "qcom,mdss-dsi-ce-off-command-state");
 	// } KuroCHChung@fih-foxconn.com CABC Porting 20151029
 
+	mdss_dsi_parse_dcs_cmds(np, &ctrl_pdata->low_power_fps_cmds,
+		"qcom,nbq-low-power-fps-command",
+		"qcom,nbq-low-power-fps-command-state");
+	mdss_dsi_parse_dcs_cmds(np, &ctrl_pdata->mid_power_fps_cmds,
+		"qcom,nbq-mid-power-fps-command",
+		"qcom,nbq-mid-power-fps-command-state");
+	mdss_dsi_parse_dcs_cmds(np, &ctrl_pdata->default_power_fps_cmds,
+		"qcom,nbq-default-power-fps-command",
+		"qcom,nbq-default-power-fps-command-state");
+
 	return 0;
 
 error:
@@ -2206,6 +2238,59 @@ int mdss_dsi_panel_init(struct device_node *node,
 	ctrl_pdata->low_power_config = mdss_dsi_panel_low_power_config;
 	ctrl_pdata->panel_data.set_backlight = mdss_dsi_panel_bl_ctrl;
 	ctrl_pdata->switch_mode = mdss_dsi_panel_switch_mode;
+
+	return 0;
+}
+
+int mdss_dsi_panel_update_fps(struct mdss_dsi_ctrl_pdata *ctrl_pdata,
+			      int new_fps)
+{
+	int old_fps;
+	int bucket_fps;
+
+	if (ctrl_pdata == NULL) {
+		pr_err("%s: Invalid ctrl_pdata\n", __func__);
+		return -EBUSY;
+	}
+
+	/*
+	* We only have support for 3 FPS modes -- 60Hz, 45Hz, and 30Hz.  So
+	* round down the requested FPS to the nearest bucket.
+	*/
+	old_fps = ctrl_pdata->panel_data.panel_info.mipi.refresh_rate;
+	if (new_fps >= LCM_PANEL_DEFAULT_FPS_VAL) {
+		bucket_fps = LCM_PANEL_DEFAULT_FPS_VAL;
+	} else if (new_fps >= LCM_PANEL_MID_FPS_VAL) {
+		bucket_fps = LCM_PANEL_MID_FPS_VAL;
+	} else {
+		bucket_fps = LCM_PANEL_LOW_FPS_VAL;
+	}
+
+	if (bucket_fps == old_fps) {
+		/* Nothing to do */
+		return 0;
+	}
+
+	switch (bucket_fps) {
+	case LCM_PANEL_DEFAULT_FPS_VAL:
+		mdss_dsi_panel_cmds_send(ctrl_pdata,
+					 &ctrl_pdata->default_power_fps_cmds,
+					 CMD_REQ_COMMIT);
+		break;
+	case LCM_PANEL_MID_FPS_VAL:
+		mdss_dsi_panel_cmds_send(ctrl_pdata,
+					 &ctrl_pdata->mid_power_fps_cmds,
+					 CMD_REQ_COMMIT);
+		break;
+	case LCM_PANEL_LOW_FPS_VAL:
+		mdss_dsi_panel_cmds_send(ctrl_pdata,
+					 &ctrl_pdata->low_power_fps_cmds,
+					 CMD_REQ_COMMIT);
+		break;
+	default:
+		break;
+	}
+	ctrl_pdata->panel_data.panel_info.mipi.refresh_rate = bucket_fps;
 
 	return 0;
 }
