@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
  * Author: Brian Swetland <swetland@google.com>
  *
  * This software is licensed under the terms of the GNU General Public
@@ -88,7 +88,8 @@ static int q6asm_memory_map_regions(struct audio_client *ac, int dir,
 static int q6asm_memory_unmap_regions(struct audio_client *ac, int dir);
 static void q6asm_reset_buf_state(struct audio_client *ac);
 
-static int q6asm_map_channels(u8 *channel_mapping, uint32_t channels);
+static int q6asm_map_channels(u8 *channel_mapping, uint32_t channels,
+				bool use_back_flavor);
 void *q6asm_mmap_apr_reg(void);
 
 static int q6asm_is_valid_session(struct apr_client_data *data, void *priv);
@@ -314,12 +315,12 @@ static void config_debug_fs_write(struct audio_buffer *ab)
 }
 static void config_debug_fs_init(void)
 {
-	out_buffer = kmalloc(OUT_BUFFER_SIZE, GFP_KERNEL);
+	out_buffer = kzalloc(OUT_BUFFER_SIZE, GFP_KERNEL);
 	if (out_buffer == NULL) {
 		pr_err("%s: kmalloc() for out_buffer failed\n", __func__);
 		goto outbuf_fail;
 	}
-	in_buffer = kmalloc(IN_BUFFER_SIZE, GFP_KERNEL);
+	in_buffer = kzalloc(IN_BUFFER_SIZE, GFP_KERNEL);
 	if (in_buffer == NULL) {
 		pr_err("%s: kmalloc() for in_buffer failed\n", __func__);
 		goto inbuf_fail;
@@ -1160,8 +1161,9 @@ int q6asm_audio_client_buf_alloc(unsigned int dir,
 	struct audio_buffer *buf;
 	size_t len;
 
-	if (!(ac) || ((dir != IN) && (dir != OUT))) {
-		pr_err("%s: ac %p dir %d\n", __func__, ac, dir);
+	if (!(ac) || !(bufsz) || ((dir != IN) && (dir != OUT))) {
+		pr_err("%s: ac %p bufsz %d dir %d\n", __func__, ac, bufsz,
+			dir);
 		return -EINVAL;
 	}
 
@@ -2711,7 +2713,8 @@ int q6asm_set_shared_circ_buff(struct audio_client *ac,
 			       int dir)
 {
 	struct audio_buffer *buf_circ;
-	int bytes_to_alloc, rc, len;
+	int bytes_to_alloc, rc;
+	size_t len;
 
 	buf_circ = kzalloc(sizeof(struct audio_buffer), GFP_KERNEL);
 
@@ -2730,7 +2733,7 @@ int q6asm_set_shared_circ_buff(struct audio_client *ac,
 	rc = msm_audio_ion_alloc("audio_client", &buf_circ->client,
 			&buf_circ->handle, bytes_to_alloc,
 			(ion_phys_addr_t *)&buf_circ->phys,
-			(size_t *)&len, &buf_circ->data);
+			&len, &buf_circ->data);
 
 	if (rc) {
 		pr_err("%s: Audio ION alloc is failed, rc = %d\n", __func__,
@@ -2772,7 +2775,8 @@ int q6asm_set_shared_pos_buff(struct audio_client *ac,
 			       int dir)
 {
 	struct audio_buffer *buf_pos = &ac->shared_pos_buf;
-	int len, rc;
+	int rc;
+	size_t len;
 	int bytes_to_alloc = sizeof(struct asm_shared_position_buffer);
 
 	mutex_lock(&ac->cmd_lock);
@@ -2781,7 +2785,7 @@ int q6asm_set_shared_pos_buff(struct audio_client *ac,
 
 	rc = msm_audio_ion_alloc("audio_client", &buf_pos->client,
 			&buf_pos->handle, bytes_to_alloc,
-			(ion_phys_addr_t *)&buf_pos->phys, (size_t *)&len,
+			(ion_phys_addr_t *)&buf_pos->phys, &len,
 			&buf_pos->data);
 
 	if (rc) {
@@ -2925,7 +2929,7 @@ int q6asm_open_shared_io(struct audio_client *ac,
 
 	memset(channel_mapping, 0, PCM_FORMAT_MAX_NUM_CHANNEL);
 
-	rc = q6asm_map_channels(channel_mapping, config->channels);
+	rc = q6asm_map_channels(channel_mapping, config->channels, false);
 	if (rc) {
 		pr_err("%s: Map channels failed, ret: %d\n", __func__, rc);
 		goto done;
@@ -3243,7 +3247,7 @@ int q6asm_set_encdec_chan_map(struct audio_client *ac,
 	channel_mapping = chan_map.channel_mapping;
 	memset(channel_mapping, PCM_CHANNEL_NULL, MAX_CHAN_MAP_CHANNELS);
 
-	if (q6asm_map_channels(channel_mapping, num_channels)) {
+	if (q6asm_map_channels(channel_mapping, num_channels, false)) {
 		pr_err("%s: map channels failed %d\n", __func__, num_channels);
 		return -EINVAL;
 	}
@@ -3331,7 +3335,7 @@ int q6asm_enc_cfg_blk_pcm_v3(struct audio_client *ac,
 	if (use_default_chmap) {
 		pr_debug("%s: setting default channel map for %d channels",
 			 __func__, channels);
-		if (q6asm_map_channels(channel_mapping, channels)) {
+		if (q6asm_map_channels(channel_mapping, channels, false)) {
 			pr_err("%s: map channels failed %d\n",
 			       __func__, channels);
 			rc = -EINVAL;
@@ -3401,7 +3405,7 @@ int q6asm_enc_cfg_blk_pcm_v2(struct audio_client *ac,
 
 	memset(channel_mapping, 0, PCM_FORMAT_MAX_NUM_CHANNEL);
 
-	if (q6asm_map_channels(channel_mapping, channels)) {
+	if (q6asm_map_channels(channel_mapping, channels, use_back_flavor)) {
 		pr_err("%s: map channels failed %d", __func__, channels);
 		return -EINVAL;
 	}
@@ -3440,22 +3444,23 @@ static int __q6asm_enc_cfg_blk_pcm_v3(struct audio_client *ac,
 }
 
 static int __q6asm_enc_cfg_blk_pcm(struct audio_client *ac,
-		uint32_t rate, uint32_t channels, uint16_t bits_per_sample)
+		uint32_t rate, uint32_t channels, uint16_t bits_per_sample, bool use_back_flavor)
 {
 	return q6asm_enc_cfg_blk_pcm_v2(ac, rate, channels,
 					bits_per_sample, true, false, NULL);
 }
 
 int q6asm_enc_cfg_blk_pcm(struct audio_client *ac,
-			uint32_t rate, uint32_t channels)
+			uint32_t rate, uint32_t channels, bool use_back_flavor)
 {
-	return __q6asm_enc_cfg_blk_pcm(ac, rate, channels, 16);
+	return __q6asm_enc_cfg_blk_pcm(ac, rate, channels, 16, use_back_flavor);
 }
 
 int q6asm_enc_cfg_blk_pcm_format_support(struct audio_client *ac,
 		uint32_t rate, uint32_t channels, uint16_t bits_per_sample)
 {
-	 return __q6asm_enc_cfg_blk_pcm(ac, rate, channels, bits_per_sample);
+	 return __q6asm_enc_cfg_blk_pcm(ac, rate, channels,
+			 bits_per_sample, false);
 }
 
 /*
@@ -3509,7 +3514,7 @@ int q6asm_enc_cfg_blk_pcm_native(struct audio_client *ac,
 
 	memset(channel_mapping, 0, PCM_FORMAT_MAX_NUM_CHANNEL);
 
-	if (q6asm_map_channels(channel_mapping, channels)) {
+	if (q6asm_map_channels(channel_mapping, channels, false)) {
 		pr_err("%s: map channels failed %d\n", __func__, channels);
 		return -EINVAL;
 	}
@@ -3537,7 +3542,8 @@ fail_cmd:
 	return -EINVAL;
 }
 
-static int q6asm_map_channels(u8 *channel_mapping, uint32_t channels)
+static int q6asm_map_channels(u8 *channel_mapping, uint32_t channels,
+		bool use_back_flavor)
 {
 	u8 *lchannel_mapping;
 	lchannel_mapping = channel_mapping;
@@ -3554,21 +3560,27 @@ static int q6asm_map_channels(u8 *channel_mapping, uint32_t channels)
 	} else if (channels == 4) {
 		lchannel_mapping[0] = PCM_CHANNEL_FL;
 		lchannel_mapping[1] = PCM_CHANNEL_FR;
-		lchannel_mapping[2] = PCM_CHANNEL_LS;
-		lchannel_mapping[3] = PCM_CHANNEL_RS;
+		lchannel_mapping[2] = use_back_flavor ?
+			PCM_CHANNEL_LB : PCM_CHANNEL_LS;
+		lchannel_mapping[3] = use_back_flavor ?
+			PCM_CHANNEL_RB : PCM_CHANNEL_RS;
 	} else if (channels == 5) {
 		lchannel_mapping[0] = PCM_CHANNEL_FL;
 		lchannel_mapping[1] = PCM_CHANNEL_FR;
 		lchannel_mapping[2] = PCM_CHANNEL_FC;
-		lchannel_mapping[3] = PCM_CHANNEL_LS;
-		lchannel_mapping[4] = PCM_CHANNEL_RS;
+		lchannel_mapping[3] = use_back_flavor ?
+			PCM_CHANNEL_LB : PCM_CHANNEL_LS;
+		lchannel_mapping[4] = use_back_flavor ?
+			PCM_CHANNEL_RB : PCM_CHANNEL_RS;
 	} else if (channels == 6) {
 		lchannel_mapping[0] = PCM_CHANNEL_FL;
 		lchannel_mapping[1] = PCM_CHANNEL_FR;
 		lchannel_mapping[2] = PCM_CHANNEL_FC;
 		lchannel_mapping[3] = PCM_CHANNEL_LFE;
-		lchannel_mapping[4] = PCM_CHANNEL_LS;
-		lchannel_mapping[5] = PCM_CHANNEL_RS;
+		lchannel_mapping[4] = use_back_flavor ?
+			PCM_CHANNEL_LB : PCM_CHANNEL_LS;
+		lchannel_mapping[5] = use_back_flavor ?
+			PCM_CHANNEL_RB : PCM_CHANNEL_RS;
 	} else if (channels == 8) {
 		lchannel_mapping[0] = PCM_CHANNEL_FL;
 		lchannel_mapping[1] = PCM_CHANNEL_FR;
@@ -3946,7 +3958,7 @@ static int __q6asm_media_format_block_pcm(struct audio_client *ac,
 	memset(channel_mapping, 0, PCM_FORMAT_MAX_NUM_CHANNEL);
 
 	if (use_default_chmap) {
-		if (q6asm_map_channels(channel_mapping, channels)) {
+		if (q6asm_map_channels(channel_mapping, channels, false)) {
 			pr_err("%s: map channels failed %d\n",
 				__func__, channels);
 			return -EINVAL;
@@ -4021,7 +4033,7 @@ static int __q6asm_media_format_block_pcm_v3(struct audio_client *ac,
 	memset(channel_mapping, 0, PCM_FORMAT_MAX_NUM_CHANNEL);
 
 	if (use_default_chmap) {
-		if (q6asm_map_channels(channel_mapping, channels)) {
+		if (q6asm_map_channels(channel_mapping, channels, false)) {
 			pr_err("%s: map channels failed %d\n",
 			       __func__, channels);
 			rc = -EINVAL;
@@ -4153,7 +4165,7 @@ static int __q6asm_media_format_block_multi_ch_pcm(struct audio_client *ac,
 	memset(channel_mapping, 0, PCM_FORMAT_MAX_NUM_CHANNEL);
 
 	if (use_default_chmap) {
-		if (q6asm_map_channels(channel_mapping, channels)) {
+		if (q6asm_map_channels(channel_mapping, channels, false)) {
 			pr_err("%s: map channels failed %d\n",
 				__func__, channels);
 			return -EINVAL;
@@ -4217,7 +4229,7 @@ static int __q6asm_media_format_block_multi_ch_pcm_v3(struct audio_client *ac,
 	memset(channel_mapping, 0, PCM_FORMAT_MAX_NUM_CHANNEL);
 
 	if (use_default_chmap) {
-		if (q6asm_map_channels(channel_mapping, channels)) {
+		if (q6asm_map_channels(channel_mapping, channels, false)) {
 			pr_err("%s: map channels failed %d\n",
 			       __func__, channels);
 			rc = -EINVAL;
@@ -4827,7 +4839,7 @@ static int q6asm_memory_map_regions(struct audio_client *ac, int dir,
 	struct asm_buffer_node *buffer_node = NULL;
 	int	rc = 0;
 	int    i = 0;
-	int	cmd_size = 0;
+	uint32_t cmd_size = 0;
 	uint32_t bufcnt_t;
 	uint32_t bufsz_t;
 
@@ -4849,9 +4861,24 @@ static int q6asm_memory_map_regions(struct audio_client *ac, int dir,
 		bufsz_t = PAGE_ALIGN(bufsz_t);
 	}
 
+	if (bufcnt_t > (UINT_MAX
+			- sizeof(struct avs_cmd_shared_mem_map_regions))
+			/ sizeof(struct avs_shared_map_region_payload)) {
+		pr_err("%s: Unsigned Integer Overflow. bufcnt_t = %u\n",
+				__func__, bufcnt_t);
+		return -EINVAL;
+	}
+
 	cmd_size = sizeof(struct avs_cmd_shared_mem_map_regions)
 			+ (sizeof(struct avs_shared_map_region_payload)
 							* bufcnt_t);
+
+
+	if (bufcnt > (UINT_MAX / sizeof(struct asm_buffer_node))) {
+		pr_err("%s: Unsigned Integer Overflow. bufcnt = %u\n",
+				__func__, bufcnt);
+		return -EINVAL;
+	}
 
 	buffer_node = kzalloc(sizeof(struct asm_buffer_node) * bufcnt,
 				GFP_KERNEL);
